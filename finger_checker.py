@@ -1529,7 +1529,7 @@ def main() -> None:
         )
         if not opencv_available:
             st.caption("OpenCV未インストールのため、bbox補助検出は無効です。")
-        enable_fix = st.toggle("Nanobananaで指を修正", value=False)
+        enable_fix = st.toggle("Nanobananaで指を修正", value=True)
         edit_model = st.text_input(
             "画像編集モデル",
             value=DEFAULT_EDIT_MODEL,
@@ -1538,10 +1538,10 @@ def main() -> None:
         output_size_label = st.radio(
             "Nanobanana出力サイズ",
             options=list(OUTPUT_LONG_EDGE_BY_LABEL.keys()),
-            index=0,
+            index=1,
             disabled=not enable_fix,
         )
-        output_long_edge = OUTPUT_LONG_EDGE_BY_LABEL.get(output_size_label, 2048)
+        output_long_edge = OUTPUT_LONG_EDGE_BY_LABEL.get(output_size_label, 4096)
         extra_instruction = st.text_area(
             "Nanobanana追加指示（任意）",
             value=st.session_state.get("nanobanana_extra_instruction", ""),
