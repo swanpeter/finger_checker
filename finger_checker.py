@@ -8,6 +8,7 @@ from typing import Any
 import requests
 import streamlit as st
 from PIL import Image, ImageDraw
+from basic_setting import BasicSetting
 from streamlit.errors import StreamlitSecretNotFoundError
 
 try:
@@ -21,21 +22,16 @@ except Exception:
 DEFAULT_ANALYSIS_MODEL = "gemini-3-pro-preview"
 DEFAULT_EDIT_MODEL = "gemini-3-pro-image-preview"
 API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-OUTPUT_LONG_EDGE_BY_LABEL = {
-    "2K (長辺2048px)": 2048,
-    "4K (長辺4096px)": 4096,
-}
+AUTH = BasicSetting(default_username="", default_password="")
 
 
 def get_default_api_key() -> str:
     try:
-        if "CX_GEMINI_API_KEY" in st.secrets:
-            return str(st.secrets["CX_GEMINI_API_KEY"])
         if "GEMINI_API_KEY" in st.secrets:
             return str(st.secrets["GEMINI_API_KEY"])
     except StreamlitSecretNotFoundError:
         pass
-    return os.getenv("CX_GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+    return os.getenv("GEMINI_API_KEY", "")
 
 
 def normalize_model_name(model_name: str) -> str:
@@ -1322,33 +1318,6 @@ def build_edit_prompt(
     return base_prompt
 
 
-def resize_image_to_long_edge(image_bytes: bytes, long_edge: int) -> tuple[bytes, str]:
-    if long_edge <= 0:
-        return image_bytes, "image/png"
-
-    with Image.open(io.BytesIO(image_bytes)) as source:
-        image = source.convert("RGB")
-        width, height = image.size
-        if width <= 0 or height <= 0:
-            output = io.BytesIO()
-            image.save(output, format="PNG")
-            return output.getvalue(), "image/png"
-
-        if width >= height:
-            new_width = long_edge
-            new_height = max(1, int(round(height * (long_edge / width))))
-        else:
-            new_height = long_edge
-            new_width = max(1, int(round(width * (long_edge / height))))
-
-        resampling = getattr(Image, "Resampling", Image).LANCZOS
-        resized = image.resize((new_width, new_height), resampling)
-
-    output = io.BytesIO()
-    resized.save(output, format="PNG")
-    return output.getvalue(), "image/png"
-
-
 def edit_image_with_nanobanana(
     api_key: str,
     model_name: str,
@@ -1356,7 +1325,6 @@ def edit_image_with_nanobanana(
     mime_type: str,
     analysis_json: dict[str, Any],
     fix_boxes: list[dict[str, Any]],
-    output_long_edge: int,
     extra_instruction: str,
 ) -> tuple[bytes, str | None, dict[str, Any]]:
     image_width, image_height = get_image_size(image_bytes)
@@ -1386,10 +1354,7 @@ def edit_image_with_nanobanana(
             "画像編集レスポンスに画像データが含まれていません。"
             f"モデル出力: {response_text or '(empty)'}"
         )
-    edited_bytes = image_part[0]
-    edited_mime = image_part[1] or "image/png"
-    resized_bytes, resized_mime = resize_image_to_long_edge(edited_bytes, output_long_edge)
-    return resized_bytes, resized_mime or edited_mime, raw_response
+    return image_part[0], image_part[1], raw_response
 
 
 def detect_anomalies(hands: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1418,95 +1383,17 @@ def ensure_file_state(uploaded_bytes: bytes) -> None:
     st.session_state["edit_raw"] = None
 
 
-def run_pipeline_for_image(
-    api_key: str,
-    analysis_model: str,
-    analysis_mode: str,
-    image_bytes: bytes,
-    mime_type: str,
-    enable_marking: bool,
-    enable_opencv_bbox: bool,
-    enable_fix: bool,
-    edit_model: str,
-    output_long_edge: int,
-    extra_instruction: str,
-) -> dict[str, Any]:
-    analysis_result, raw_response = analyze_image(
-        api_key=api_key,
-        model_name=analysis_model,
-        image_bytes=image_bytes,
-        mime_type=mime_type,
-        analysis_mode=analysis_mode,
-    )
-    analysis_result["analysis_mode"] = analysis_mode
-
-    anomaly_marks = collect_anomaly_marks(analysis_result)
-    fix_boxes, opencv_used = collect_fix_boxes(
-        analysis_result,
-        image_bytes=image_bytes,
-        use_opencv_refine=enable_opencv_bbox,
-    )
-
-    marked_image = None
-    if enable_marking and anomaly_marks:
-        marked_image = build_marked_image(image_bytes, anomaly_marks)
-
-    fix_boxes_preview = None
-    if fix_boxes:
-        fix_boxes_preview = build_box_preview_image(image_bytes, fix_boxes)
-
-    edited_image = None
-    edited_mime = None
-    edit_raw = None
-    auto_fix_skipped_reason = None
-
-    if enable_fix:
-        if not fix_boxes:
-            auto_fix_skipped_reason = "修正対象bboxがありません。"
-        else:
-            edited_image, edited_mime, edit_raw = edit_image_with_nanobanana(
-                api_key=api_key,
-                model_name=edit_model,
-                image_bytes=image_bytes,
-                mime_type=mime_type,
-                analysis_json=analysis_result,
-                fix_boxes=fix_boxes,
-                output_long_edge=output_long_edge,
-                extra_instruction=extra_instruction,
-            )
-
-    return {
-        "analysis_result": analysis_result,
-        "analysis_raw": raw_response,
-        "anomaly_marks": anomaly_marks,
-        "fix_boxes": fix_boxes,
-        "opencv_used": opencv_used,
-        "marked_image": marked_image,
-        "fix_boxes_preview": fix_boxes_preview,
-        "edited_image": edited_image,
-        "edited_mime": edited_mime,
-        "edit_raw": edit_raw,
-        "auto_fix_skipped_reason": auto_fix_skipped_reason,
-    }
-
-
-def build_uploaded_files_digest(uploaded_files: list[Any]) -> str:
-    hash_obj = hashlib.sha256()
-    for file_obj in uploaded_files:
-        file_name = getattr(file_obj, "name", "")
-        file_bytes = file_obj.getvalue()
-        hash_obj.update(str(file_name).encode("utf-8", errors="ignore"))
-        hash_obj.update(file_bytes)
-    return hash_obj.hexdigest()
-
-
 def main() -> None:
     st.set_page_config(page_title="Finger Checker", layout="wide")
+    AUTH.require_login()
     st.title("Finger Checker")
     st.caption("画像を1枚アップロードして、解析モード（手ごと/一括）を選んで人数・手・指を判定します。")
     api_key = get_default_api_key()
 
     with st.sidebar:
+        if st.button("ログアウト", use_container_width=True):
+            AUTH.logout()
+            st.stop()
         st.subheader("Gemini設定")
         analysis_model = st.text_input("解析モデル", value=DEFAULT_ANALYSIS_MODEL)
         analysis_mode_label = st.radio(
@@ -1531,163 +1418,17 @@ def main() -> None:
             value=DEFAULT_EDIT_MODEL,
             disabled=not enable_fix,
         )
-        output_size_label = st.radio(
-            "Nanobanana出力サイズ",
-            options=list(OUTPUT_LONG_EDGE_BY_LABEL.keys()),
-            index=0,
-            disabled=not enable_fix,
-        )
-        output_long_edge = OUTPUT_LONG_EDGE_BY_LABEL.get(output_size_label, 2048)
-        extra_instruction = st.text_area(
-            "Nanobanana追加指示（任意）",
-            value=st.session_state.get("nanobanana_extra_instruction", ""),
-            key="nanobanana_extra_instruction",
-            disabled=not enable_fix,
-            placeholder="例: 指輪などの装飾は変えずに、指の本数だけ修正してください。",
-        )
 
-    uploaded_files = st.file_uploader(
-        "画像をアップロード（複数可）",
+    uploaded_file = st.file_uploader(
+        "画像を1枚アップロード",
         type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True,
+        accept_multiple_files=False,
     )
 
-    if not uploaded_files:
+    if not uploaded_file:
         st.info("画像をアップロードすると解析を開始できます。")
         return
 
-    if len(uploaded_files) > 1:
-        st.info(f"{len(uploaded_files)}枚の画像を検出しました。順次処理できます。")
-        batch_digest = build_uploaded_files_digest(uploaded_files)
-        if st.session_state.get("batch_digest") != batch_digest:
-            st.session_state["batch_digest"] = batch_digest
-            st.session_state["batch_results"] = None
-
-        if st.button("複数画像を順次処理", type="primary", use_container_width=True):
-            if not api_key.strip():
-                st.error("GEMINI_API_KEY を .streamlit/secrets.toml または環境変数で設定してください。")
-            else:
-                total = len(uploaded_files)
-                progress = st.progress(0.0, text="処理を開始します...")
-                batch_results: list[dict[str, Any]] = []
-                for index, file_obj in enumerate(uploaded_files, start=1):
-                    progress.progress((index - 1) / total, text=f"{index}/{total} 枚目を処理中: {file_obj.name}")
-                    image_bytes = file_obj.getvalue()
-                    mime_type = file_obj.type or "image/png"
-                    try:
-                        pipeline = run_pipeline_for_image(
-                            api_key=api_key,
-                            analysis_model=analysis_model,
-                            analysis_mode=analysis_mode,
-                            image_bytes=image_bytes,
-                            mime_type=mime_type,
-                            enable_marking=enable_marking,
-                            enable_opencv_bbox=enable_opencv_bbox,
-                            enable_fix=enable_fix,
-                            edit_model=edit_model,
-                            output_long_edge=output_long_edge,
-                            extra_instruction=extra_instruction,
-                        )
-                        batch_results.append(
-                            {
-                                "file_name": file_obj.name,
-                                "ok": True,
-                                **pipeline,
-                            }
-                        )
-                    except Exception as error:
-                        batch_results.append(
-                            {
-                                "file_name": file_obj.name,
-                                "ok": False,
-                                "error": str(error),
-                            }
-                        )
-                progress.progress(1.0, text="全画像の処理が完了しました。")
-                st.session_state["batch_results"] = batch_results
-
-        batch_results = st.session_state.get("batch_results")
-        if isinstance(batch_results, list):
-            st.subheader("複数画像の処理結果")
-            for index, result in enumerate(batch_results, start=1):
-                file_name = str(result.get("file_name", f"image_{index}"))
-                with st.expander(f"{index}. {file_name}", expanded=False):
-                    if not result.get("ok"):
-                        st.error(f"処理失敗: {result.get('error', 'unknown error')}")
-                        continue
-
-                    analysis_result_multi = result.get("analysis_result", {})
-                    mode_text_multi = (
-                        "手ごと厳密（高精度・遅い）"
-                        if analysis_result_multi.get("analysis_mode") == "per_hand"
-                        else "一括解析（高速）"
-                    )
-                    st.caption(f"解析モード: {mode_text_multi}")
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("人数", analysis_result_multi.get("people_count", 0))
-                    col2.metric("手の数", analysis_result_multi.get("hands_count", 0))
-                    col3.metric("指の数", analysis_result_multi.get("fingers_count", 0))
-                    st.write(f"要約: {analysis_result_multi.get('summary', '')}")
-
-                    hands_multi = analysis_result_multi.get("hands", [])
-                    if isinstance(hands_multi, list) and hands_multi:
-                        st.write("手ごとの内訳")
-                        st.dataframe(hands_multi, use_container_width=True)
-                        anomalies_multi = detect_anomalies(
-                            [h for h in hands_multi if isinstance(h, dict)]
-                        )
-                        if anomalies_multi:
-                            st.warning(
-                                f"5本未確認（または不確実）な手があります: {len(anomalies_multi)}件"
-                            )
-                        else:
-                            st.success("全ての手で5本が明確に確認できました。")
-
-                    anomaly_marks_multi = result.get("anomaly_marks")
-                    if isinstance(anomaly_marks_multi, list) and anomaly_marks_multi:
-                        st.info(f"赤丸候補: {len(anomaly_marks_multi)}箇所")
-                        with st.expander("異常箇所の詳細（赤丸座標）", expanded=False):
-                            st.dataframe(anomaly_marks_multi, use_container_width=True)
-                    marked_image_multi = result.get("marked_image")
-                    if marked_image_multi:
-                        st.image(
-                            marked_image_multi,
-                            caption="赤丸は指の異常候補位置",
-                            use_container_width=True,
-                        )
-
-                    fix_boxes_multi = result.get("fix_boxes")
-                    if isinstance(fix_boxes_multi, list) and fix_boxes_multi:
-                        method_multi = (
-                            "OpenCV補助あり" if result.get("opencv_used") else "モデル推定bbox"
-                        )
-                        st.info(f"修正用bbox: {len(fix_boxes_multi)}件（{method_multi}）")
-                        with st.expander("修正用bboxの詳細", expanded=False):
-                            st.dataframe(fix_boxes_multi, use_container_width=True)
-                    fix_boxes_preview_multi = result.get("fix_boxes_preview")
-                    if fix_boxes_preview_multi:
-                        st.image(
-                            fix_boxes_preview_multi,
-                            caption="オレンジ枠は指修正の対象範囲",
-                            use_container_width=True,
-                        )
-
-                    if result.get("auto_fix_skipped_reason"):
-                        st.warning(f"Nanobanana自動生成をスキップ: {result['auto_fix_skipped_reason']}")
-
-                    edited_image_multi = result.get("edited_image")
-                    if edited_image_multi:
-                        st.image(edited_image_multi, caption="補正後画像", use_container_width=True)
-                        st.download_button(
-                            f"{file_name} をダウンロード",
-                            data=edited_image_multi,
-                            file_name=f"fixed_{file_name}",
-                            mime=result.get("edited_mime", "image/png"),
-                            key=f"download_fixed_{index}_{file_name}",
-                        )
-        return
-
-    uploaded_file = uploaded_files[0]
     image_bytes = uploaded_file.getvalue()
     mime_type = uploaded_file.type or "image/png"
     ensure_file_state(image_bytes)
@@ -1705,37 +1446,35 @@ def main() -> None:
                 if analysis_mode == "per_hand"
                 else "Geminiで一括解析中..."
             )
-            if enable_fix:
-                spinner_text = f"{spinner_text} / Nanobanana生成（{output_size_label}）..."
             with st.spinner(spinner_text):
                 try:
-                    pipeline = run_pipeline_for_image(
+                    analysis_result, raw_response = analyze_image(
                         api_key=api_key,
-                        analysis_model=analysis_model,
-                        analysis_mode=analysis_mode,
+                        model_name=analysis_model,
                         image_bytes=image_bytes,
                         mime_type=mime_type,
-                        enable_marking=enable_marking,
-                        enable_opencv_bbox=enable_opencv_bbox,
-                        enable_fix=enable_fix,
-                        edit_model=edit_model,
-                        output_long_edge=output_long_edge,
-                        extra_instruction=extra_instruction,
+                        analysis_mode=analysis_mode,
                     )
-                    st.session_state["analysis_result"] = pipeline["analysis_result"]
-                    st.session_state["analysis_raw"] = pipeline["analysis_raw"]
-                    st.session_state["anomaly_marks"] = pipeline["anomaly_marks"]
-                    st.session_state["fix_boxes"] = pipeline["fix_boxes"]
-                    st.session_state["opencv_used"] = pipeline["opencv_used"]
-                    st.session_state["marked_image"] = pipeline["marked_image"]
-                    st.session_state["fix_boxes_preview"] = pipeline["fix_boxes_preview"]
-                    st.session_state["edited_image"] = pipeline["edited_image"]
-                    st.session_state["edited_mime"] = pipeline["edited_mime"] or "image/png"
-                    st.session_state["edit_raw"] = pipeline["edit_raw"]
-                    if pipeline["auto_fix_skipped_reason"]:
-                        st.warning(
-                            f"Nanobanana自動生成をスキップしました（{pipeline['auto_fix_skipped_reason']}）"
-                        )
+                    analysis_result["analysis_mode"] = analysis_mode
+                    anomaly_marks = collect_anomaly_marks(analysis_result)
+                    fix_boxes, opencv_used = collect_fix_boxes(
+                        analysis_result,
+                        image_bytes=image_bytes,
+                        use_opencv_refine=enable_opencv_bbox,
+                    )
+                    st.session_state["analysis_result"] = analysis_result
+                    st.session_state["analysis_raw"] = raw_response
+                    st.session_state["anomaly_marks"] = anomaly_marks
+                    st.session_state["fix_boxes"] = fix_boxes
+                    st.session_state["opencv_used"] = opencv_used
+                    if enable_marking and anomaly_marks:
+                        st.session_state["marked_image"] = build_marked_image(image_bytes, anomaly_marks)
+                    else:
+                        st.session_state["marked_image"] = None
+                    if fix_boxes:
+                        st.session_state["fix_boxes_preview"] = build_box_preview_image(image_bytes, fix_boxes)
+                    else:
+                        st.session_state["fix_boxes_preview"] = None
                 except Exception as error:
                     st.error(f"解析に失敗しました: {error}")
 
@@ -1802,6 +1541,14 @@ def main() -> None:
             if fix_boxes_preview:
                 st.subheader("修正対象bboxプレビュー")
                 st.image(fix_boxes_preview, caption="オレンジ枠は指修正の対象範囲", use_container_width=True)
+                stem, _, _ = uploaded_file.name.rpartition(".")
+                base_name = stem if stem else uploaded_file.name
+                st.download_button(
+                    "bboxプレビューをダウンロード",
+                    data=fix_boxes_preview,
+                    file_name=f"bbox_{base_name}.png",
+                    mime="image/png",
+                )
 
         if analysis_result.get("summary"):
             st.write(f"要約: {analysis_result['summary']}")
@@ -1821,6 +1568,17 @@ def main() -> None:
             if marked_image:
                 st.subheader("異常箇所の丸付け画像")
                 st.image(marked_image, caption="赤丸は指の異常候補位置", use_container_width=True)
+                stem, _, _ = uploaded_file.name.rpartition(".")
+                base_name = stem if stem else uploaded_file.name
+                st.download_button(
+                    "丸付け画像をダウンロード",
+                    data=marked_image,
+                    file_name=f"marked_{base_name}.png",
+                    mime="image/png",
+                )
+
+        with st.expander("解析の生レスポンス(JSON)"):
+            st.json(st.session_state.get("analysis_raw", {}))
 
     if enable_fix and analysis_result:
         st.subheader("Nanobanana 指補正")
@@ -1829,8 +1587,12 @@ def main() -> None:
             fix_boxes_for_edit = []
         if not fix_boxes_for_edit:
             st.warning("修正対象bboxが見つかっていません。解析を再実行するか、画像を見直してください。")
-        st.caption(f"出力サイズ: {output_size_label}")
-        if st.button("Nanobananaで再生成", use_container_width=True):
+        extra_instruction = st.text_area(
+            "追加指示（任意）",
+            value="",
+            placeholder="例: 指輪などの装飾は変えずに、指の本数だけ修正してください。",
+        )
+        if st.button("指だけ修正する", use_container_width=True):
             if not api_key.strip():
                 st.error("補正前に GEMINI_API_KEY を .streamlit/secrets.toml または環境変数で設定してください。")
             else:
@@ -1843,7 +1605,6 @@ def main() -> None:
                             mime_type=mime_type,
                             analysis_json=analysis_result,
                             fix_boxes=fix_boxes_for_edit,
-                            output_long_edge=output_long_edge,
                             extra_instruction=extra_instruction,
                         )
                         st.session_state["edited_image"] = edited_image
@@ -1864,6 +1625,8 @@ def main() -> None:
                 file_name=f"fixed_{uploaded_file.name}",
                 mime=st.session_state.get("edited_mime", "image/png"),
             )
+            with st.expander("補正の生レスポンス(JSON)"):
+                st.json(st.session_state.get("edit_raw", {}))
 
 
 if __name__ == "__main__":
