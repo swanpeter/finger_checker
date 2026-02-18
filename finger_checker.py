@@ -604,7 +604,7 @@ def format_fix_boxes_for_prompt(
     fix_boxes: list[dict[str, Any]], image_width: int, image_height: int
 ) -> str:
     if not fix_boxes:
-        return "修正対象バウンディングボックスは指定なし。"
+        return "修正対象の参照領域は指定なし。"
 
     lines: list[str] = []
     for index, box in enumerate(fix_boxes, start=1):
@@ -614,7 +614,7 @@ def format_fix_boxes_for_prompt(
         source = str(box.get("source", "unknown"))
         reason = str(box.get("reason", ""))
         lines.append(
-            f"- B{index}: left={left}, top={top}, right={right}, bottom={bottom}, "
+            f"- R{index}: left={left}, top={top}, right={right}, bottom={bottom}, "
             f"source={source}, reason={reason}"
         )
     return "\n".join(lines)
@@ -1303,14 +1303,16 @@ def build_edit_prompt(
 - 顔、人物ID、体、服、背景、ライティング、画角、全体スタイルは維持。
 - 人数は変えない。
 - 新しい物体は追加しない。
-- まず下記のバウンディングボックス内の指を優先して修正する。
-- B1..Bn を全て対象にする。1つでも未修正を残さない。
+- まず下記の参照領域内の指を優先して修正する。
+- R1..Rn を全て対象にする。1つでも未修正を残さない。
 - どれか1箇所だけ修正して終了しない。
-- バウンディングボックス外の変更は最小限。
-- バウンディングボックスは内部参照用。画像上に枠線・線・文字・番号・注釈を絶対に描かない。
+- 参照領域外の変更は最小限。
+- 参照領域は内部参照用。座標情報を見た目として描画してはいけない。
+- 枠線・四角形・丸・線・矢印・文字・番号・注釈を画像上に絶対に描かない。
+- 黄/オレンジ/赤の枠線を1つでも描いてはいけない。
 - 最終出力は通常の完成画像のみ。デバッグ表示やガイド表示は禁止。
 
-修正対象バウンディングボックス（ピクセル座標）:
+修正対象参照領域（ピクセル座標。描画禁止）:
 {fix_box_text}
 
 解析結果（参照用）:
@@ -1320,6 +1322,143 @@ def build_edit_prompt(
     if extra_instruction.strip():
         return f"{base_prompt}\n\n追加指示:\n{extra_instruction.strip()}"
     return base_prompt
+
+
+def decode_image_to_bgr(image_bytes: bytes) -> Any | None:
+    if cv2 is None or np is None:
+        return None
+    np_bytes = np.frombuffer(image_bytes, dtype=np.uint8)
+    if np_bytes.size == 0:
+        return None
+    return cv2.imdecode(np_bytes, cv2.IMREAD_COLOR)
+
+
+def build_overlay_artifact_mask(image_bgr: Any) -> Any | None:
+    if cv2 is None or np is None or image_bgr is None:
+        return None
+
+    height, width = image_bgr.shape[:2]
+    if width <= 0 or height <= 0:
+        return None
+
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    yellow_mask = cv2.inRange(
+        hsv,
+        np.array([12, 60, 120], dtype=np.uint8),
+        np.array([45, 255, 255], dtype=np.uint8),
+    )
+    orange_mask = cv2.inRange(
+        hsv,
+        np.array([0, 100, 120], dtype=np.uint8),
+        np.array([15, 255, 255], dtype=np.uint8),
+    )
+    color_mask = cv2.bitwise_or(yellow_mask, orange_mask)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    result_mask = np.zeros_like(color_mask)
+    image_area = float(width * height)
+
+    for contour in contours:
+        contour_area = float(cv2.contourArea(contour))
+        if contour_area < 80.0:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        rect_area = float(max(1, w * h))
+        if rect_area < 300.0 or rect_area > image_area * 0.2:
+            continue
+
+        aspect = w / float(max(1, h))
+        if aspect < 0.2 or aspect > 5.0:
+            continue
+
+        perimeter = float(cv2.arcLength(contour, True))
+        if perimeter <= 0.0:
+            continue
+        approx = cv2.approxPolyDP(contour, 0.04 * perimeter, True)
+        if len(approx) < 4 or len(approx) > 8:
+            continue
+
+        # 枠線っぽい輪郭だけを対象にする（塗りつぶしオブジェクトは除外）。
+        fill_ratio = contour_area / rect_area
+        if fill_ratio > 0.45:
+            continue
+
+        stroke = max(2, int(round(min(w, h) * 0.07)))
+        cv2.drawContours(result_mask, [contour], -1, 255, thickness=stroke)
+
+    result_mask = cv2.dilate(result_mask, kernel, iterations=2)
+    return result_mask
+
+
+def has_overlay_artifacts(image_bytes: bytes) -> bool:
+    if cv2 is None or np is None:
+        return False
+    image_bgr = decode_image_to_bgr(image_bytes)
+    if image_bgr is None:
+        return False
+    mask = build_overlay_artifact_mask(image_bgr)
+    if mask is None:
+        return False
+    return int((mask > 0).sum()) >= 120
+
+
+def remove_overlay_artifacts_with_inpaint(image_bytes: bytes) -> bytes | None:
+    if cv2 is None or np is None:
+        return None
+    image_bgr = decode_image_to_bgr(image_bytes)
+    if image_bgr is None:
+        return None
+    mask = build_overlay_artifact_mask(image_bgr)
+    if mask is None or int((mask > 0).sum()) < 120:
+        return None
+    inpainted = cv2.inpaint(image_bgr, mask, 4, cv2.INPAINT_TELEA)
+    ok, encoded = cv2.imencode(".png", inpainted)
+    if not ok:
+        return None
+    return bytes(encoded.tobytes())
+
+
+def build_cleanup_prompt() -> str:
+    return """
+この画像に重ね描きされた注釈だけを除去してください。
+
+厳守:
+- 黄/オレンジ/赤の四角枠、丸、線、矢印、文字、番号、ラベルを完全に消す。
+- 人物、手、指、顔、服、背景、ライティング、画角、全体スタイルは変えない。
+- 人数を変えない。新規オブジェクトを追加しない。
+- 最終出力は注釈のない完成画像1枚のみ。
+""".strip()
+
+
+def cleanup_overlay_artifacts(
+    api_key: str,
+    model_name: str,
+    image_bytes: bytes,
+    mime_type: str,
+) -> tuple[bytes, str | None, dict[str, Any]]:
+    generation_config = {
+        "temperature": 0.1,
+        "responseModalities": ["TEXT", "IMAGE"],
+    }
+    raw_response = post_gemini_request(
+        api_key=api_key,
+        model_name=model_name,
+        prompt=build_cleanup_prompt(),
+        image_bytes=image_bytes,
+        mime_type=mime_type,
+        generation_config=generation_config,
+    )
+    image_part = extract_image_part(raw_response)
+    if image_part is None:
+        response_text = extract_text(raw_response)
+        raise ValueError(
+            "注釈除去レスポンスに画像データが含まれていません。"
+            f"モデル出力: {response_text or '(empty)'}"
+        )
+    return image_part[0], image_part[1], raw_response
 
 
 def resize_image_to_long_edge(image_bytes: bytes, long_edge: int) -> tuple[bytes, str]:
@@ -1388,8 +1527,41 @@ def edit_image_with_nanobanana(
         )
     edited_bytes = image_part[0]
     edited_mime = image_part[1] or "image/png"
-    resized_bytes, resized_mime = resize_image_to_long_edge(edited_bytes, output_long_edge)
-    return resized_bytes, resized_mime or edited_mime, raw_response
+
+    debug_bundle: dict[str, Any] = {
+        "edit_raw": raw_response,
+        "cleanup_passes": [],
+        "inpaint_fallback_applied": False,
+    }
+
+    working_bytes = edited_bytes
+    working_mime = edited_mime
+    for _ in range(2):
+        if not has_overlay_artifacts(working_bytes):
+            break
+        try:
+            cleaned_bytes, cleaned_mime, cleanup_raw = cleanup_overlay_artifacts(
+                api_key=api_key,
+                model_name=model_name,
+                image_bytes=working_bytes,
+                mime_type=working_mime,
+            )
+            debug_bundle["cleanup_passes"].append({"ok": True, "raw": cleanup_raw})
+            working_bytes = cleaned_bytes
+            working_mime = cleaned_mime or "image/png"
+        except Exception as error:
+            debug_bundle["cleanup_passes"].append({"ok": False, "error": str(error)})
+            break
+
+    if has_overlay_artifacts(working_bytes):
+        inpainted = remove_overlay_artifacts_with_inpaint(working_bytes)
+        if inpainted:
+            working_bytes = inpainted
+            working_mime = "image/png"
+            debug_bundle["inpaint_fallback_applied"] = True
+
+    resized_bytes, resized_mime = resize_image_to_long_edge(working_bytes, output_long_edge)
+    return resized_bytes, resized_mime or working_mime, debug_bundle
 
 
 def detect_anomalies(hands: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1826,33 +1998,65 @@ def main() -> None:
                 st.subheader("異常箇所の丸付け画像")
                 st.image(marked_image, caption="赤丸は指の異常候補位置", use_container_width=True)
 
-    if enable_fix and analysis_result:
+    if enable_fix:
         st.subheader("Nanobanana 指補正")
+        analysis_result_for_edit = analysis_result if isinstance(analysis_result, dict) else None
         fix_boxes_for_edit = st.session_state.get("fix_boxes")
         if not isinstance(fix_boxes_for_edit, list):
             fix_boxes_for_edit = []
-        if not fix_boxes_for_edit:
+        if analysis_result_for_edit is None:
+            st.info("解析結果がありません。再生成ボタンを押すと解析と補正を続けて実行します。")
+        elif not fix_boxes_for_edit:
             st.warning("修正対象bboxが見つかっていません。解析を再実行するか、画像を見直してください。")
         st.caption(f"出力サイズ: {output_size_label}")
         if st.button("Nanobananaで再生成", use_container_width=True):
             if not api_key.strip():
                 st.error("補正前に GEMINI_API_KEY を .streamlit/secrets.toml または環境変数で設定してください。")
             else:
-                with st.spinner("画像補正を実行中..."):
+                with st.spinner("Nanobananaで再生成中..."):
                     try:
-                        edited_image, edited_mime, edit_raw = edit_image_with_nanobanana(
-                            api_key=api_key,
-                            model_name=edit_model,
-                            image_bytes=image_bytes,
-                            mime_type=mime_type,
-                            analysis_json=analysis_result,
-                            fix_boxes=fix_boxes_for_edit,
-                            output_long_edge=output_long_edge,
-                            extra_instruction=extra_instruction,
-                        )
-                        st.session_state["edited_image"] = edited_image
-                        st.session_state["edited_mime"] = edited_mime or "image/png"
-                        st.session_state["edit_raw"] = edit_raw
+                        if analysis_result_for_edit is None:
+                            pipeline = run_pipeline_for_image(
+                                api_key=api_key,
+                                analysis_model=analysis_model,
+                                analysis_mode=analysis_mode,
+                                image_bytes=image_bytes,
+                                mime_type=mime_type,
+                                enable_marking=enable_marking,
+                                enable_opencv_bbox=enable_opencv_bbox,
+                                enable_fix=False,
+                                edit_model=edit_model,
+                                output_long_edge=output_long_edge,
+                                extra_instruction=extra_instruction,
+                            )
+                            st.session_state["analysis_result"] = pipeline["analysis_result"]
+                            st.session_state["analysis_raw"] = pipeline["analysis_raw"]
+                            st.session_state["anomaly_marks"] = pipeline["anomaly_marks"]
+                            st.session_state["fix_boxes"] = pipeline["fix_boxes"]
+                            st.session_state["opencv_used"] = pipeline["opencv_used"]
+                            st.session_state["marked_image"] = pipeline["marked_image"]
+                            st.session_state["fix_boxes_preview"] = pipeline["fix_boxes_preview"]
+                            analysis_result_for_edit = pipeline["analysis_result"]
+                            fix_boxes_for_edit = pipeline["fix_boxes"] if isinstance(
+                                pipeline.get("fix_boxes"), list
+                            ) else []
+
+                        if not fix_boxes_for_edit:
+                            st.warning("修正対象bboxが見つからないため、再生成をスキップしました。")
+                        else:
+                            edited_image, edited_mime, edit_raw = edit_image_with_nanobanana(
+                                api_key=api_key,
+                                model_name=edit_model,
+                                image_bytes=image_bytes,
+                                mime_type=mime_type,
+                                analysis_json=analysis_result_for_edit,
+                                fix_boxes=fix_boxes_for_edit,
+                                output_long_edge=output_long_edge,
+                                extra_instruction=extra_instruction,
+                            )
+                            st.session_state["edited_image"] = edited_image
+                            st.session_state["edited_mime"] = edited_mime or "image/png"
+                            st.session_state["edit_raw"] = edit_raw
                     except Exception as error:
                         st.error(f"補正に失敗しました: {error}")
 
