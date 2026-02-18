@@ -1461,6 +1461,114 @@ def cleanup_overlay_artifacts(
     return image_part[0], image_part[1], raw_response
 
 
+def image_to_png_bytes(image: Image.Image) -> bytes:
+    output = io.BytesIO()
+    image.convert("RGB").save(output, format="PNG")
+    return output.getvalue()
+
+
+def build_local_patch_edit_prompt(
+    target_left: int,
+    target_top: int,
+    target_right: int,
+    target_bottom: int,
+    crop_width: int,
+    crop_height: int,
+    box: dict[str, Any],
+    extra_instruction: str,
+) -> str:
+    source = str(box.get("source", "unknown"))
+    reason = str(box.get("reason", "")).strip()
+    base_prompt = f"""
+この画像は元画像の一部を切り出したパッチです。
+目的: 指の本数だけを修正し、明確に見える手は5本指にしてください。
+
+編集対象領域（このパッチ内のピクセル座標）:
+left={target_left}, top={target_top}, right={target_right}, bottom={target_bottom}
+
+厳守:
+- 編集は編集対象領域内の手・指のみ。
+- 編集対象領域の外側は変更しない。
+- 顔、体、服、背景、ライティング、色調、構図、画角、スタイルを維持。
+- 人物数・物体数は変更しない。
+- 文字、番号、枠線、四角、丸、矢印など注釈を描かない。
+- 最終出力は通常画像のみ。
+
+補足:
+- source={source}
+- reason={reason or '(none)'}
+- patch_size={crop_width}x{crop_height}
+""".strip()
+
+    if extra_instruction.strip():
+        return f"{base_prompt}\n\n追加指示:\n{extra_instruction.strip()}"
+    return base_prompt
+
+
+def edit_patch_with_nanobanana(
+    api_key: str,
+    model_name: str,
+    patch_bytes: bytes,
+    patch_mime_type: str,
+    prompt: str,
+) -> tuple[bytes, str | None, dict[str, Any]]:
+    generation_config = {
+        "temperature": 0.15,
+        "responseModalities": ["TEXT", "IMAGE"],
+    }
+    raw_response = post_gemini_request(
+        api_key=api_key,
+        model_name=model_name,
+        prompt=prompt,
+        image_bytes=patch_bytes,
+        mime_type=patch_mime_type,
+        generation_config=generation_config,
+    )
+    image_part = extract_image_part(raw_response)
+    if image_part is None:
+        response_text = extract_text(raw_response)
+        raise ValueError(
+            "部分編集レスポンスに画像データが含まれていません。"
+            f"モデル出力: {response_text or '(empty)'}"
+        )
+
+    edited_bytes = image_part[0]
+    edited_mime = image_part[1] or "image/png"
+    debug_info: dict[str, Any] = {
+        "raw": raw_response,
+        "cleanup_passes": [],
+        "inpaint_fallback_applied": False,
+    }
+
+    working_bytes = edited_bytes
+    working_mime = edited_mime
+    for _ in range(2):
+        if not has_overlay_artifacts(working_bytes):
+            break
+        try:
+            cleaned_bytes, cleaned_mime, cleanup_raw = cleanup_overlay_artifacts(
+                api_key=api_key,
+                model_name=model_name,
+                image_bytes=working_bytes,
+                mime_type=working_mime,
+            )
+            debug_info["cleanup_passes"].append({"ok": True, "raw": cleanup_raw})
+            working_bytes = cleaned_bytes
+            working_mime = cleaned_mime or "image/png"
+        except Exception as error:
+            debug_info["cleanup_passes"].append({"ok": False, "error": str(error)})
+            break
+
+    if has_overlay_artifacts(working_bytes):
+        inpainted = remove_overlay_artifacts_with_inpaint(working_bytes)
+        if inpainted:
+            working_bytes = inpainted
+            working_mime = "image/png"
+            debug_info["inpaint_fallback_applied"] = True
+
+    return working_bytes, working_mime, debug_info
+
+
 def resize_image_to_long_edge(image_bytes: bytes, long_edge: int) -> tuple[bytes, str]:
     if long_edge <= 0:
         return image_bytes, "image/png"
@@ -1498,70 +1606,138 @@ def edit_image_with_nanobanana(
     output_long_edge: int,
     extra_instruction: str,
 ) -> tuple[bytes, str | None, dict[str, Any]]:
-    image_width, image_height = get_image_size(image_bytes)
-    prompt = build_edit_prompt(
-        analysis_json=analysis_json,
-        fix_boxes=fix_boxes,
-        image_width=image_width,
-        image_height=image_height,
-        extra_instruction=extra_instruction,
-    )
-    generation_config = {
-        "temperature": 0.2,
-        "responseModalities": ["TEXT", "IMAGE"],
-    }
-    raw_response = post_gemini_request(
-        api_key=api_key,
-        model_name=model_name,
-        prompt=prompt,
-        image_bytes=image_bytes,
-        mime_type=mime_type,
-        generation_config=generation_config,
-    )
-    image_part = extract_image_part(raw_response)
-    if image_part is None:
-        response_text = extract_text(raw_response)
-        raise ValueError(
-            "画像編集レスポンスに画像データが含まれていません。"
-            f"モデル出力: {response_text or '(empty)'}"
-        )
-    edited_bytes = image_part[0]
-    edited_mime = image_part[1] or "image/png"
+    # 厳密モード: bboxごとの局所編集結果だけを元画像に貼り戻し、bbox外の画素を固定する。
+    with Image.open(io.BytesIO(image_bytes)) as source:
+        base_image = source.convert("RGB")
+    image_width, image_height = base_image.size
 
     debug_bundle: dict[str, Any] = {
-        "edit_raw": raw_response,
-        "cleanup_passes": [],
-        "inpaint_fallback_applied": False,
+        "mode": "strict_local_patch",
+        "regions": [],
+        "analysis_summary": str(analysis_json.get("summary", "")),
     }
 
-    working_bytes = edited_bytes
-    working_mime = edited_mime
-    for _ in range(2):
-        if not has_overlay_artifacts(working_bytes):
-            break
+    if not fix_boxes:
+        resized_bytes, resized_mime = resize_image_to_long_edge(image_bytes, output_long_edge)
+        debug_bundle["skipped_reason"] = "fix_boxes_empty"
+        return resized_bytes, resized_mime or "image/png", debug_bundle
+
+    sorted_boxes = sorted(
+        fix_boxes,
+        key=lambda box: (to_float(box.get("width")) or 0.0) * (to_float(box.get("height")) or 0.0),
+        reverse=True,
+    )
+
+    working_image = base_image.copy()
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
+
+    for region_index, box in enumerate(sorted_boxes, start=1):
+        core_left, core_top, core_width, core_height = normalized_box_to_pixel(
+            box,
+            image_width,
+            image_height,
+        )
+        core_right = min(image_width, core_left + core_width)
+        core_bottom = min(image_height, core_top + core_height)
+        core_width = max(1, core_right - core_left)
+        core_height = max(1, core_bottom - core_top)
+
+        if core_width <= 0 or core_height <= 0:
+            debug_bundle["regions"].append(
+                {
+                    "index": region_index,
+                    "ok": False,
+                    "error": "invalid_core_box",
+                }
+            )
+            continue
+
+        pad_x = max(12, int(round(core_width * 0.35)))
+        pad_y = max(12, int(round(core_height * 0.35)))
+        context_left = max(0, core_left - pad_x)
+        context_top = max(0, core_top - pad_y)
+        context_right = min(image_width, core_right + pad_x)
+        context_bottom = min(image_height, core_bottom + pad_y)
+        context_width = max(1, context_right - context_left)
+        context_height = max(1, context_bottom - context_top)
+
+        target_left = core_left - context_left
+        target_top = core_top - context_top
+        target_right = target_left + core_width
+        target_bottom = target_top + core_height
+
+        context_crop = working_image.crop((context_left, context_top, context_right, context_bottom))
+        context_bytes = image_to_png_bytes(context_crop)
+
+        local_prompt = build_local_patch_edit_prompt(
+            target_left=target_left,
+            target_top=target_top,
+            target_right=target_right,
+            target_bottom=target_bottom,
+            crop_width=context_width,
+            crop_height=context_height,
+            box=box,
+            extra_instruction=extra_instruction,
+        )
+
         try:
-            cleaned_bytes, cleaned_mime, cleanup_raw = cleanup_overlay_artifacts(
+            edited_patch_bytes, edited_patch_mime, patch_debug = edit_patch_with_nanobanana(
                 api_key=api_key,
                 model_name=model_name,
-                image_bytes=working_bytes,
-                mime_type=working_mime,
+                patch_bytes=context_bytes,
+                patch_mime_type="image/png",
+                prompt=local_prompt,
             )
-            debug_bundle["cleanup_passes"].append({"ok": True, "raw": cleanup_raw})
-            working_bytes = cleaned_bytes
-            working_mime = cleaned_mime or "image/png"
+
+            with Image.open(io.BytesIO(edited_patch_bytes)) as edited_patch_source:
+                edited_patch = edited_patch_source.convert("RGB")
+
+            if edited_patch.size != (context_width, context_height):
+                edited_patch = edited_patch.resize((context_width, context_height), resampling)
+
+            updated_core = edited_patch.crop((target_left, target_top, target_right, target_bottom))
+            if updated_core.size != (core_width, core_height):
+                updated_core = updated_core.resize((core_width, core_height), resampling)
+            working_image.paste(updated_core, (core_left, core_top))
+
+            debug_bundle["regions"].append(
+                {
+                    "index": region_index,
+                    "ok": True,
+                    "core_box": {
+                        "left": core_left,
+                        "top": core_top,
+                        "right": core_right,
+                        "bottom": core_bottom,
+                    },
+                    "context_box": {
+                        "left": context_left,
+                        "top": context_top,
+                        "right": context_right,
+                        "bottom": context_bottom,
+                    },
+                    "mime": edited_patch_mime or "image/png",
+                    "debug": patch_debug,
+                }
+            )
         except Exception as error:
-            debug_bundle["cleanup_passes"].append({"ok": False, "error": str(error)})
-            break
+            debug_bundle["regions"].append(
+                {
+                    "index": region_index,
+                    "ok": False,
+                    "error": str(error),
+                    "core_box": {
+                        "left": core_left,
+                        "top": core_top,
+                        "right": core_right,
+                        "bottom": core_bottom,
+                    },
+                }
+            )
 
-    if has_overlay_artifacts(working_bytes):
-        inpainted = remove_overlay_artifacts_with_inpaint(working_bytes)
-        if inpainted:
-            working_bytes = inpainted
-            working_mime = "image/png"
-            debug_bundle["inpaint_fallback_applied"] = True
-
-    resized_bytes, resized_mime = resize_image_to_long_edge(working_bytes, output_long_edge)
-    return resized_bytes, resized_mime or working_mime, debug_bundle
+    composited_bytes = image_to_png_bytes(working_image)
+    resized_bytes, resized_mime = resize_image_to_long_edge(composited_bytes, output_long_edge)
+    return resized_bytes, resized_mime or "image/png", debug_bundle
 
 
 def detect_anomalies(hands: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1767,6 +1943,8 @@ def main() -> None:
                         batch_results.append(
                             {
                                 "file_name": file_obj.name,
+                                "image_bytes": image_bytes,
+                                "mime_type": mime_type,
                                 "ok": True,
                                 **pipeline,
                             }
@@ -1775,6 +1953,8 @@ def main() -> None:
                         batch_results.append(
                             {
                                 "file_name": file_obj.name,
+                                "image_bytes": image_bytes,
+                                "mime_type": mime_type,
                                 "ok": False,
                                 "error": str(error),
                             }
@@ -1861,6 +2041,78 @@ def main() -> None:
                             mime=result.get("edited_mime", "image/png"),
                             key=f"download_fixed_{index}_{file_name}",
                         )
+                    if enable_fix:
+                        if st.button(
+                            "Nanobananaで再生成",
+                            key=f"regen_batch_{index}_{file_name}",
+                            use_container_width=True,
+                        ):
+                            if not api_key.strip():
+                                st.error(
+                                    "補正前に GEMINI_API_KEY を .streamlit/secrets.toml または環境変数で設定してください。"
+                                )
+                            else:
+                                source_bytes = result.get("image_bytes")
+                                source_mime = str(result.get("mime_type") or "image/png")
+                                if not isinstance(source_bytes, (bytes, bytearray)):
+                                    st.error("元画像データが見つからないため再生成できませんでした。")
+                                else:
+                                    with st.spinner(f"{file_name} を再生成中..."):
+                                        try:
+                                            analysis_result_for_edit = result.get("analysis_result")
+                                            fix_boxes_for_edit = result.get("fix_boxes")
+
+                                            if not isinstance(analysis_result_for_edit, dict):
+                                                analysis_result_for_edit = None
+                                            if not isinstance(fix_boxes_for_edit, list):
+                                                fix_boxes_for_edit = []
+
+                                            if analysis_result_for_edit is None or not fix_boxes_for_edit:
+                                                pipeline_refresh = run_pipeline_for_image(
+                                                    api_key=api_key,
+                                                    analysis_model=analysis_model,
+                                                    analysis_mode=analysis_mode,
+                                                    image_bytes=bytes(source_bytes),
+                                                    mime_type=source_mime,
+                                                    enable_marking=enable_marking,
+                                                    enable_opencv_bbox=enable_opencv_bbox,
+                                                    enable_fix=False,
+                                                    edit_model=edit_model,
+                                                    output_long_edge=output_long_edge,
+                                                    extra_instruction=extra_instruction,
+                                                )
+                                                result["analysis_result"] = pipeline_refresh["analysis_result"]
+                                                result["analysis_raw"] = pipeline_refresh["analysis_raw"]
+                                                result["anomaly_marks"] = pipeline_refresh["anomaly_marks"]
+                                                result["fix_boxes"] = pipeline_refresh["fix_boxes"]
+                                                result["opencv_used"] = pipeline_refresh["opencv_used"]
+                                                result["marked_image"] = pipeline_refresh["marked_image"]
+                                                result["fix_boxes_preview"] = pipeline_refresh["fix_boxes_preview"]
+                                                analysis_result_for_edit = pipeline_refresh["analysis_result"]
+                                                fix_boxes_for_edit = pipeline_refresh["fix_boxes"]
+
+                                            if not isinstance(fix_boxes_for_edit, list) or not fix_boxes_for_edit:
+                                                st.warning("修正対象bboxが見つからないため、再生成をスキップしました。")
+                                            else:
+                                                edited_image, edited_mime, edit_raw = edit_image_with_nanobanana(
+                                                    api_key=api_key,
+                                                    model_name=edit_model,
+                                                    image_bytes=bytes(source_bytes),
+                                                    mime_type=source_mime,
+                                                    analysis_json=analysis_result_for_edit,
+                                                    fix_boxes=fix_boxes_for_edit,
+                                                    output_long_edge=output_long_edge,
+                                                    extra_instruction=extra_instruction,
+                                                )
+                                                result["edited_image"] = edited_image
+                                                result["edited_mime"] = edited_mime or "image/png"
+                                                result["edit_raw"] = edit_raw
+                                                result["auto_fix_skipped_reason"] = None
+                                                result["ok"] = True
+                                                st.session_state["batch_results"] = batch_results
+                                                st.rerun()
+                                        except Exception as error:
+                                            st.error(f"再生成に失敗しました: {error}")
         return
 
     uploaded_file = uploaded_files[0]
