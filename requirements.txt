@@ -1,0 +1,5 @@
+streamlit>=1.39.0
+requests>=2.32.0
+Pillow>=10.4.0
+opencv-python-headless>=4.10.0
+numpy>=1.26.0
